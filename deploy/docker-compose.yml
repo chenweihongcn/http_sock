@@ -1,0 +1,37 @@
+services:
+  proxy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: lowres-proxy
+    restart: unless-stopped
+    ports:
+      - "8899:8899"
+      - "1080:1080"
+      - "8088:8088"
+    environment:
+      LISTEN_HOST: 0.0.0.0
+      HTTP_PORT: 8899
+      SOCKS5_PORT: 1080
+      ADMIN_PORT: 8088
+      DIAL_TIMEOUT: 15s
+      CONTROL_PLANE_ENABLED: "true"
+      DB_PATH: /app/data/proxy.db
+      ADMIN_TOKEN: change-me
+      READONLY_ADMIN_TOKEN: readonly-change-me
+      DEVICE_WINDOW: 10m
+      BOOTSTRAP_USER: admin
+      BOOTSTRAP_PASS: admin123
+      BOOTSTRAP_READONLY: ops
+    mem_limit: 256m
+    cpus: 1.00
+    volumes:
+      - proxy_data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  proxy_data:
