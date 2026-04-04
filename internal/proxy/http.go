@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"http-proxy-platform/internal/config"
+	"http-proxy-platform/internal/netutil"
 )
 
 type HTTPProxyServer struct {
@@ -88,7 +89,8 @@ func (h *HTTPProxyServer) authorizeHTTP(r *http.Request) (string, bool) {
 	if len(pair) != 2 {
 		return "", false
 	}
-	sourceIP := sourceIPFromAddr(r.RemoteAddr)
+	ipInfo := netutil.ResolveClientIP(r, h.cfg.TrustProxyHeaders, h.cfg.RealIPHeader)
+	sourceIP := ipInfo.ClientIP
 	if !h.auth.Validate(pair[0], pair[1], sourceIP) {
 		return "", false
 	}
@@ -178,11 +180,7 @@ func tunnelWithUsage(a, b net.Conn, onDone func(total int64)) {
 }
 
 func sourceIPFromAddr(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr
-	}
-	return host
+	return netutil.NormalizeIP(netutil.FromRemoteAddr(addr))
 }
 
 func (h *HTTPProxyServer) recordUsage(username string, bytes int64) {

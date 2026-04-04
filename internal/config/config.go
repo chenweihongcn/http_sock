@@ -12,16 +12,22 @@ type Config struct {
 	HTTPPort            int
 	SOCKS5Port          int
 	AdminPort           int
+	TrustProxyHeaders   bool
+	RealIPHeader        string
 	DialTimeout         time.Duration
 	Users               map[string]string
 	ControlPlaneEnabled bool
 	DBPath              string
-	AdminToken          string
-	ReadOnlyAdminToken  string
 	DeviceWindow        time.Duration
 	BootstrapUser       string
 	BootstrapPass       string
 	BootstrapReadOnly   string
+	BootstrapAdminUser  string
+	BootstrapAdminPass  string
+	ReadOnlyAdminPass   string
+	AdminSessionTTL     time.Duration
+	AdminCookieSecure   bool
+	PasswordMinLength   int
 }
 
 func LoadFromEnv() Config {
@@ -30,16 +36,22 @@ func LoadFromEnv() Config {
 		HTTPPort:            getEnvInt("HTTP_PORT", 8899),
 		SOCKS5Port:          getEnvInt("SOCKS5_PORT", 1080),
 		AdminPort:           getEnvInt("ADMIN_PORT", 8088),
+		TrustProxyHeaders:   getEnvBool("TRUST_PROXY_HEADERS", false),
+		RealIPHeader:        getEnv("REAL_IP_HEADER", "X-Forwarded-For"),
 		DialTimeout:         getEnvDuration("DIAL_TIMEOUT", 15*time.Second),
 		Users:               parseUsers(getEnv("PROXY_USERS", "admin:admin123")),
 		ControlPlaneEnabled: getEnvBool("CONTROL_PLANE_ENABLED", true),
 		DBPath:              getEnv("DB_PATH", "./data/proxy.db"),
-		AdminToken:          getEnv("ADMIN_TOKEN", "change-me"),
-		ReadOnlyAdminToken:  getEnv("READONLY_ADMIN_TOKEN", "readonly-change-me"),
 		DeviceWindow:        getEnvDuration("DEVICE_WINDOW", 10*time.Minute),
 		BootstrapUser:       getEnv("BOOTSTRAP_USER", "admin"),
 		BootstrapPass:       getEnv("BOOTSTRAP_PASS", "admin123"),
 		BootstrapReadOnly:   getEnv("BOOTSTRAP_READONLY", "ops"),
+		BootstrapAdminUser:  getEnv("BOOTSTRAP_ADMIN_USER", getEnv("BOOTSTRAP_USER", "admin")),
+		BootstrapAdminPass:  getEnv("BOOTSTRAP_ADMIN_PASS", getEnv("BOOTSTRAP_PASS", "admin123")),
+		ReadOnlyAdminPass:   getEnv("BOOTSTRAP_READONLY_PASS", "ops123456"),
+		AdminSessionTTL:     getEnvDuration("ADMIN_SESSION_TTL", 12*time.Hour),
+		AdminCookieSecure:   getEnvBool("ADMIN_COOKIE_SECURE", false),
+		PasswordMinLength:   getEnvInt("PASSWORD_MIN_LENGTH", 8),
 	}
 	return cfg
 }

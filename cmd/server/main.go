@@ -30,7 +30,7 @@ func main() {
 		if err := store.EnsureBootstrapUser(cfg.BootstrapUser, cfg.BootstrapPass); err != nil {
 			log.Fatalf("bootstrap user failed: %v", err)
 		}
-		if err := store.EnsureBootstrapAdmins(cfg.BootstrapUser, cfg.AdminToken, cfg.BootstrapReadOnly, cfg.ReadOnlyAdminToken); err != nil {
+		if err := store.EnsureBootstrapAdmins(cfg.BootstrapAdminUser, cfg.BootstrapAdminPass, cfg.BootstrapReadOnly, cfg.ReadOnlyAdminPass); err != nil {
 			log.Fatalf("bootstrap admins failed: %v", err)
 		}
 

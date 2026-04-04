@@ -1,0 +1,23 @@
+# Local runtime artifacts
+*.cookie
+*.json
+*.tar
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+live_home.html
+proxy-server-openwrt-arm64
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local helper outputs
+diag_*.png
+shot_*.png
+login.json
+new-admin*.json
+new-admin*.cookie
+admin.cookie

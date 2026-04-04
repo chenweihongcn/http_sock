@@ -3,15 +3,25 @@ set -eu
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/deploy/docker-compose.yml"
-ADMIN_TOKEN="${ADMIN_TOKEN:-change-me}"
-READONLY_ADMIN_TOKEN="${READONLY_ADMIN_TOKEN:-readonly-change-me}"
 HTTP_PORT="${HTTP_PORT:-8899}"
 SOCKS5_PORT="${SOCKS5_PORT:-1080}"
 ADMIN_PORT="${ADMIN_PORT:-8088}"
+BOOTSTRAP_ADMIN_USER="${BOOTSTRAP_ADMIN_USER:-admin}"
+BOOTSTRAP_ADMIN_PASS="${BOOTSTRAP_ADMIN_PASS:-admin123}"
+BOOTSTRAP_READONLY="${BOOTSTRAP_READONLY:-ops}"
+BOOTSTRAP_READONLY_PASS="${BOOTSTRAP_READONLY_PASS:-ops123456}"
 TEST_USER="e2e_$(date +%s)"
-TEST_PASS="p_$(date +%s)"
+TEST_PASS="Pass_$(date +%s)"
 TEST_ADMIN="adm_$(date +%s)"
-TEST_ADMIN_TOKEN="adm_tok_$(date +%s)"
+TEST_ADMIN_PASS="AdmPass_$(date +%s)"
+ADMIN_COOKIE="${TMPDIR:-/tmp}/proxy_admin_cookie_$$.txt"
+RO_COOKIE="${TMPDIR:-/tmp}/proxy_ro_cookie_$$.txt"
+TEST_ADMIN_COOKIE="${TMPDIR:-/tmp}/proxy_test_admin_cookie_$$.txt"
+
+cleanup() {
+  rm -f "$ADMIN_COOKIE" "$RO_COOKIE" "$TEST_ADMIN_COOKIE"
+}
+trap cleanup EXIT INT TERM
 
 log() {
   printf '%s\n' "$*"
@@ -29,20 +39,30 @@ check_http_status_contains_ok() {
   echo "$payload" | grep '"ok":true' >/dev/null 2>&1
 }
 
-log "[1/8] Checking required commands"
+login_cookie() {
+  cookie_file="$1"
+  username="$2"
+  password="$3"
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -c "$cookie_file" -X POST "http://127.0.0.1:${ADMIN_PORT}/api/admin/login" \
+    -H 'Content-Type: application/json' \
+    -d "{\"username\":\"${username}\",\"password\":\"${password}\"}" || true)"
+  [ "$code" -eq 200 ]
+}
+
+log "[1/10] Checking required commands"
 require_cmd docker
 require_cmd curl
 
-log "[2/8] Checking Docker daemon"
+log "[2/10] Checking Docker daemon"
 if ! docker version >/dev/null 2>&1; then
   log "docker daemon is not ready"
   exit 1
 fi
 
-log "[3/8] Starting stack"
+log "[3/10] Starting stack"
 docker compose -f "$COMPOSE_FILE" up -d --build
 
-log "[4/8] Waiting admin health"
+log "[4/10] Waiting admin health"
 i=0
 while [ "$i" -lt 30 ]; do
   body="$(curl -sS "http://127.0.0.1:${ADMIN_PORT}/api/admin/healthz" || true)"
@@ -58,10 +78,16 @@ while [ "$i" -lt 30 ]; do
   fi
 done
 
-log "[5/8] Creating test user: ${TEST_USER}"
+log "[5/10] Logging in as super admin"
+if ! login_cookie "$ADMIN_COOKIE" "$BOOTSTRAP_ADMIN_USER" "$BOOTSTRAP_ADMIN_PASS"; then
+  log "super admin login failed"
+  exit 1
+fi
+
+log "[6/10] Creating test user: ${TEST_USER}"
 create_resp="$(curl -sS -X POST "http://127.0.0.1:${ADMIN_PORT}/api/admin/users" \
-  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-  -H "Content-Type: application/json" \
+  -b "$ADMIN_COOKIE" \
+  -H 'Content-Type: application/json' \
   -d "{\"username\":\"${TEST_USER}\",\"password\":\"${TEST_PASS}\",\"max_devices\":1,\"quota_bytes\":10485760,\"expires_at\":0}" )"
 
 echo "$create_resp" | grep '"ok":true' >/dev/null 2>&1 || {
@@ -69,14 +95,14 @@ echo "$create_resp" | grep '"ok":true' >/dev/null 2>&1 || {
   exit 1
 }
 
-log "[6/8] Verifying user exists in list"
-list_resp="$(curl -sS "http://127.0.0.1:${ADMIN_PORT}/api/admin/users" -H "Authorization: Bearer ${ADMIN_TOKEN}")"
+log "[7/10] Verifying user exists in list"
+list_resp="$(curl -sS "http://127.0.0.1:${ADMIN_PORT}/api/admin/users?offset=0&limit=20" -b "$ADMIN_COOKIE")"
 echo "$list_resp" | grep "\"username\":\"${TEST_USER}\"" >/dev/null 2>&1 || {
   log "user not found in list"
   exit 1
 }
 
-log "[7/8] Testing HTTP and SOCKS5 proxies"
+log "[8/10] Testing HTTP and SOCKS5 proxies"
 http_code="$(curl -sS -o /dev/null -w '%{http_code}' -x "http://${TEST_USER}:${TEST_PASS}@127.0.0.1:${HTTP_PORT}" http://example.com || true)"
 if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 500 ]; then
   log "http proxy check failed, status=$http_code"
@@ -89,8 +115,8 @@ if [ "$socks_code" -lt 200 ] || [ "$socks_code" -ge 500 ]; then
   exit 1
 fi
 
-log "[8/8] Testing disable policy"
-disable_resp="$(curl -sS -X POST "http://127.0.0.1:${ADMIN_PORT}/api/admin/users/${TEST_USER}/disable" -H "Authorization: Bearer ${ADMIN_TOKEN}")"
+log "[9/10] Testing disable policy"
+disable_resp="$(curl -sS -X POST "http://127.0.0.1:${ADMIN_PORT}/api/admin/users/${TEST_USER}/disable" -b "$ADMIN_COOKIE")"
 echo "$disable_resp" | grep '"ok":true' >/dev/null 2>&1 || {
   log "disable user failed: $disable_resp"
   exit 1
@@ -102,60 +128,44 @@ if [ "$blocked_code" -ne 407 ]; then
   exit 1
 fi
 
-log "[extra] Verifying readonly role behavior"
-ro_get_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${ADMIN_PORT}/api/admin/users" \
-  -H "Authorization: Bearer ${READONLY_ADMIN_TOKEN}" || true)"
+log "[10/10] Verifying readonly role and admin management"
+if ! login_cookie "$RO_COOKIE" "$BOOTSTRAP_READONLY" "$BOOTSTRAP_READONLY_PASS"; then
+  log "readonly admin login failed"
+  exit 1
+fi
+
+ro_get_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${ADMIN_PORT}/api/admin/users" -b "$RO_COOKIE" || true)"
 if [ "$ro_get_code" -ne 200 ]; then
   log "readonly GET users failed, status=$ro_get_code"
   exit 1
 fi
 
 ro_post_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${ADMIN_PORT}/api/admin/users" \
-  -H "Authorization: Bearer ${READONLY_ADMIN_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"ro_fail","password":"x","max_devices":1,"quota_bytes":1,"expires_at":0}' || true)"
+  -b "$RO_COOKIE" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"ro_fail","password":"password88","max_devices":1,"quota_bytes":1,"expires_at":0}' || true)"
 if [ "$ro_post_code" -ne 403 ]; then
   log "readonly POST users should be 403, got=$ro_post_code"
   exit 1
 fi
 
-log "[extra] Verifying admin management endpoints"
 admin_create_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${ADMIN_PORT}/api/admin/admins" \
-  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"${TEST_ADMIN}\",\"token\":\"${TEST_ADMIN_TOKEN}\",\"role\":\"readonly\"}" || true)"
+  -b "$ADMIN_COOKIE" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"${TEST_ADMIN}\",\"password\":\"${TEST_ADMIN_PASS}\",\"role\":\"readonly\"}" || true)"
 if [ "$admin_create_code" -ne 201 ]; then
   log "create admin failed, status=$admin_create_code"
   exit 1
 fi
 
-admin_me_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${ADMIN_PORT}/api/admin/me" \
-  -H "Authorization: Bearer ${TEST_ADMIN_TOKEN}" || true)"
+if ! login_cookie "$TEST_ADMIN_COOKIE" "$TEST_ADMIN" "$TEST_ADMIN_PASS"; then
+  log "new admin password login failed"
+  exit 1
+fi
+
+admin_me_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${ADMIN_PORT}/api/admin/me" -b "$TEST_ADMIN_COOKIE" || true)"
 if [ "$admin_me_code" -ne 200 ]; then
-  log "new admin token not accepted, status=$admin_me_code"
-  exit 1
-fi
-
-admin_rotate_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${ADMIN_PORT}/api/admin/admins/${TEST_ADMIN}/rotate-token" \
-  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d "{\"token\":\"${TEST_ADMIN_TOKEN}_new\"}" || true)"
-if [ "$admin_rotate_code" -ne 200 ]; then
-  log "rotate admin token failed, status=$admin_rotate_code"
-  exit 1
-fi
-
-admin_new_me_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${ADMIN_PORT}/api/admin/me" \
-  -H "Authorization: Bearer ${TEST_ADMIN_TOKEN}_new" || true)"
-if [ "$admin_new_me_code" -ne 200 ]; then
-  log "rotated admin token not accepted, status=$admin_new_me_code"
-  exit 1
-fi
-
-admin_old_me_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${ADMIN_PORT}/api/admin/me" \
-  -H "Authorization: Bearer ${TEST_ADMIN_TOKEN}" || true)"
-if [ "$admin_old_me_code" -ne 401 ]; then
-  log "old admin token should be rejected, got status=$admin_old_me_code"
+  log "new admin session not accepted, status=$admin_me_code"
   exit 1
 fi
 

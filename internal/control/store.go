@@ -2,8 +2,10 @@ package control
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -12,10 +14,12 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type User struct {
 	Username   string `json:"username"`
+	Tag        string `json:"tag"`
 	Status     int    `json:"status"`
 	ExpiresAt  int64  `json:"expires_at"`
 	QuotaBytes int64  `json:"quota_bytes"`
@@ -26,21 +30,59 @@ type User struct {
 	ActiveIPs  int    `json:"active_ips"`
 }
 
+type UserDevice struct {
+	IP       string `json:"ip"`
+	LastSeen int64  `json:"last_seen"`
+}
+
+type UserListQuery struct {
+	Search       string
+	Status       *int
+	Tag          string
+	ExpireFilter string
+	Offset       int
+	Limit        int
+}
+
+type UserListResult struct {
+	Items  []User `json:"items"`
+	Total  int    `json:"total"`
+	Offset int    `json:"offset"`
+	Limit  int    `json:"limit"`
+}
+
 type Admin struct {
-	Username  string `json:"username"`
-	Role      string `json:"role"`
-	Status    int    `json:"status"`
-	CreatedAt int64  `json:"created_at"`
-	UpdatedAt int64  `json:"updated_at"`
+	Username    string `json:"username"`
+	Role        string `json:"role"`
+	Status      int    `json:"status"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+	PasswordSet bool   `json:"password_set"`
+}
+
+type AdminSession struct {
+	SessionID    string `json:"session_id"`
+	Username     string `json:"username"`
+	CreatedAt    int64  `json:"created_at"`
+	LastActivity int64  `json:"last_activity"`
+	ExpiresAt    int64  `json:"expires_at"`
+	IPAddress    string `json:"ip_address"`
+	OriginalIP   string `json:"original_ip"`
+	UserAgent    string `json:"user_agent"`
 }
 
 type AuditQuery struct {
-	Actor     string
-	Action    string
-	Target    string
-	CreatedTo int64
+	Actor       string
+	Action      string
+	Target      string
+	CreatedTo   int64
 	CreatedFrom int64
-	Limit     int
+	Limit       int
+}
+
+type adminCredentials struct {
+	Admin
+	PasswordHash string
 }
 
 type Store struct {
@@ -120,86 +162,106 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 CREATE TABLE IF NOT EXISTS admins (
   username TEXT PRIMARY KEY,
   token TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL DEFAULT '',
   role TEXT NOT NULL,
   status INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS admin_sessions (
+  session_id TEXT PRIMARY KEY,
+  admin_username TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_activity INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  ip_address TEXT NOT NULL DEFAULT '',
+	original_ip_address TEXT NOT NULL DEFAULT '',
+  user_agent TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_active_ips_last_seen ON active_ips(last_seen);
 CREATE INDEX IF NOT EXISTS idx_audit_created_at ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_admins_token ON admins(token);
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_username ON admin_sessions(admin_username);
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at);
 `
-	_, err := s.db.Exec(schema)
-	return err
-}
-
-func (s *Store) EnsureBootstrapAdmins(superUser, superToken, readonlyUser, readonlyToken string) error {
-	now := time.Now().Unix()
-	if strings.TrimSpace(superUser) != "" && strings.TrimSpace(superToken) != "" {
-		if _, err := s.db.Exec(`
-INSERT INTO admins(username, token, role, status, created_at, updated_at)
-VALUES (?, ?, 'super', 1, ?, ?)
-ON CONFLICT(username) DO UPDATE SET token = excluded.token, role = excluded.role, status = 1, updated_at = excluded.updated_at
-`, strings.TrimSpace(superUser), strings.TrimSpace(superToken), now, now); err != nil {
-			return err
-		}
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
 	}
-
-	if strings.TrimSpace(readonlyUser) != "" && strings.TrimSpace(readonlyToken) != "" {
-		if _, err := s.db.Exec(`
-INSERT INTO admins(username, token, role, status, created_at, updated_at)
-VALUES (?, ?, 'readonly', 1, ?, ?)
-ON CONFLICT(username) DO UPDATE SET token = excluded.token, role = excluded.role, status = 1, updated_at = excluded.updated_at
-`, strings.TrimSpace(readonlyUser), strings.TrimSpace(readonlyToken), now, now); err != nil {
-			return err
-		}
+	if err := s.ensureColumn("admins", "password_hash", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
 	}
-
+	if err := s.ensureColumn("users", "tag", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("admin_sessions", "original_ip_address", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (s *Store) AuthenticateAdminToken(ctx context.Context, token string) (Admin, error) {
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return Admin{}, sql.ErrNoRows
-	}
-
-	var a Admin
-	err := s.db.QueryRowContext(ctx, `
-SELECT username, role, status, created_at, updated_at
-FROM admins
-WHERE token = ?
-`, token).Scan(&a.Username, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+func (s *Store) ensureColumn(tableName, columnName, definition string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + tableName + `)`)
 	if err != nil {
-		return Admin{}, err
-	}
-	if a.Status != 1 {
-		return Admin{}, errors.New("admin_disabled")
-	}
-	return a, nil
-}
-
-func (s *Store) ListAdmins(ctx context.Context) ([]Admin, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT username, role, status, created_at, updated_at
-FROM admins
-ORDER BY created_at DESC
-`)
-	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
 
-	items := make([]Admin, 0)
 	for rows.Next() {
-		var a Admin
-		if err := rows.Scan(&a.Username, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt); err != nil {
-			return nil, err
+		var cid int
+		var name, dataType string
+		var notNull, pk int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			return err
 		}
-		items = append(items, a)
+		if strings.EqualFold(name, columnName) {
+			return nil
+		}
 	}
-	return items, rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE ` + tableName + ` ADD COLUMN ` + columnName + ` ` + definition)
+	return err
+}
+
+func hashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
+}
+
+func isBcryptHash(value string) bool {
+	return strings.HasPrefix(value, "$2a$") || strings.HasPrefix(value, "$2b$") || strings.HasPrefix(value, "$2y$")
+}
+
+func verifyStoredPassword(stored, raw string) (bool, bool) {
+	if stored == "" || raw == "" {
+		return false, false
+	}
+	if isBcryptHash(stored) {
+		return bcrypt.CompareHashAndPassword([]byte(stored), []byte(raw)) == nil, false
+	}
+	return subtle.ConstantTimeCompare([]byte(stored), []byte(raw)) == 1, true
+}
+
+func randomSecret(size int) string {
+	if size <= 0 {
+		size = 32
+	}
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+	}
+	return base64.RawURLEncoding.EncodeToString(buf)
+}
+
+func disabledToken() string {
+	return "disabled-" + randomSecret(18)
 }
 
 func normalizeAdminRole(role string) (string, error) {
@@ -210,21 +272,114 @@ func normalizeAdminRole(role string) (string, error) {
 	return "", errors.New("invalid role")
 }
 
-func (s *Store) CreateAdmin(ctx context.Context, username, token, role string) error {
+func (s *Store) EnsureBootstrapAdmins(superUser, superPassword, readonlyUser, readonlyPassword string) error {
+	now := time.Now().Unix()
+	if strings.TrimSpace(superUser) != "" && strings.TrimSpace(superPassword) != "" {
+		hash, err := hashPassword(strings.TrimSpace(superPassword))
+		if err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`
+INSERT INTO admins(username, token, password_hash, role, status, created_at, updated_at)
+VALUES (?, ?, ?, 'super', 1, ?, ?)
+ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash, role = excluded.role, status = 1, updated_at = excluded.updated_at
+`, strings.TrimSpace(superUser), disabledToken(), hash, now, now); err != nil {
+			return err
+		}
+	}
+
+	if strings.TrimSpace(readonlyUser) != "" && strings.TrimSpace(readonlyPassword) != "" {
+		hash, err := hashPassword(strings.TrimSpace(readonlyPassword))
+		if err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`
+INSERT INTO admins(username, token, password_hash, role, status, created_at, updated_at)
+VALUES (?, ?, ?, 'readonly', 1, ?, ?)
+ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash, role = excluded.role, status = 1, updated_at = excluded.updated_at
+`, strings.TrimSpace(readonlyUser), disabledToken(), hash, now, now); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Store) getAdminCredentials(ctx context.Context, username string) (adminCredentials, error) {
+	var item adminCredentials
+	var passwordHash string
+	err := s.db.QueryRowContext(ctx, `
+SELECT username, role, status, created_at, updated_at, password_hash
+FROM admins
+WHERE username = ?
+`, strings.TrimSpace(username)).Scan(&item.Username, &item.Role, &item.Status, &item.CreatedAt, &item.UpdatedAt, &passwordHash)
+	if err != nil {
+		return adminCredentials{}, err
+	}
+	item.PasswordHash = passwordHash
+	item.PasswordSet = passwordHash != ""
+	return item, nil
+}
+
+func (s *Store) AuthenticateAdminPassword(ctx context.Context, username, password string) (Admin, error) {
+	item, err := s.getAdminCredentials(ctx, username)
+	if err != nil {
+		return Admin{}, err
+	}
+	if item.Status != 1 {
+		return Admin{}, errors.New("admin_disabled")
+	}
+	ok, _ := verifyStoredPassword(item.PasswordHash, password)
+	if !ok {
+		return Admin{}, errors.New("invalid_credentials")
+	}
+	return item.Admin, nil
+}
+
+func (s *Store) ListAdmins(ctx context.Context) ([]Admin, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT username, role, status, created_at, updated_at,
+CASE WHEN password_hash <> '' THEN 1 ELSE 0 END AS password_set
+FROM admins
+ORDER BY created_at DESC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]Admin, 0)
+	for rows.Next() {
+		var item Admin
+		var passwordSet int
+		if err := rows.Scan(&item.Username, &item.Role, &item.Status, &item.CreatedAt, &item.UpdatedAt, &passwordSet); err != nil {
+			return nil, err
+		}
+		item.PasswordSet = passwordSet == 1
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) CreateAdmin(ctx context.Context, username, password, role string) error {
 	username = strings.TrimSpace(username)
-	token = strings.TrimSpace(token)
-	if username == "" || token == "" {
-		return errors.New("username and token are required")
+	password = strings.TrimSpace(password)
+	if username == "" || password == "" {
+		return errors.New("username and password are required")
 	}
 	normalizedRole, err := normalizeAdminRole(role)
 	if err != nil {
 		return err
 	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return err
+	}
 	now := time.Now().Unix()
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO admins(username, token, role, status, created_at, updated_at)
-VALUES (?, ?, ?, 1, ?, ?)
-`, username, token, normalizedRole, now, now)
+INSERT INTO admins(username, token, password_hash, role, status, created_at, updated_at)
+VALUES (?, ?, ?, ?, 1, ?, ?)
+`, username, disabledToken(), hash, normalizedRole, now, now)
 	return err
 }
 
@@ -254,18 +409,128 @@ WHERE username = ?
 	return err
 }
 
-func (s *Store) RotateAdminToken(ctx context.Context, username, newToken string) error {
+func (s *Store) SetAdminPassword(ctx context.Context, username, password string) error {
 	username = strings.TrimSpace(username)
-	newToken = strings.TrimSpace(newToken)
-	if username == "" || newToken == "" {
-		return errors.New("username and new_token are required")
+	password = strings.TrimSpace(password)
+	if username == "" || password == "" {
+		return errors.New("username and password are required")
+	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+UPDATE admins
+SET password_hash = ?, updated_at = ?
+WHERE username = ?
+`, hash, time.Now().Unix(), username)
+	return err
+}
+
+func (s *Store) ChangeAdminPassword(ctx context.Context, username, oldPassword, newPassword string) error {
+	item, err := s.getAdminCredentials(ctx, username)
+	if err != nil {
+		return err
+	}
+	ok, _ := verifyStoredPassword(item.PasswordHash, strings.TrimSpace(oldPassword))
+	if !ok {
+		return errors.New("invalid_old_password")
+	}
+	return s.SetAdminPassword(ctx, username, newPassword)
+}
+
+func (s *Store) cleanupExpiredSessions(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM admin_sessions WHERE expires_at < ?`, time.Now().Unix())
+	return err
+}
+
+func (s *Store) CreateAdminSession(ctx context.Context, username, ipAddress, originalIP, userAgent string, ttl time.Duration) (AdminSession, error) {
+	if err := s.cleanupExpiredSessions(ctx); err != nil {
+		return AdminSession{}, err
+	}
+	now := time.Now().Unix()
+	expiresAt := now + int64(ttl.Seconds())
+	item := AdminSession{
+		SessionID:    randomSecret(32),
+		Username:     strings.TrimSpace(username),
+		CreatedAt:    now,
+		LastActivity: now,
+		ExpiresAt:    expiresAt,
+		IPAddress:    strings.TrimSpace(ipAddress),
+		OriginalIP:   strings.TrimSpace(originalIP),
+		UserAgent:    strings.TrimSpace(userAgent),
 	}
 	_, err := s.db.ExecContext(ctx, `
-UPDATE admins
-SET token = ?, updated_at = ?
-WHERE username = ?
-`, newToken, time.Now().Unix(), username)
+INSERT INTO admin_sessions(session_id, admin_username, created_at, last_activity, expires_at, ip_address, original_ip_address, user_agent)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`, item.SessionID, item.Username, item.CreatedAt, item.LastActivity, item.ExpiresAt, item.IPAddress, item.OriginalIP, item.UserAgent)
+	if err != nil {
+		return AdminSession{}, err
+	}
+	return item, nil
+}
+
+func (s *Store) ValidateAdminSession(ctx context.Context, sessionID string, ttl time.Duration) (Admin, error) {
+	if err := s.cleanupExpiredSessions(ctx); err != nil {
+		return Admin{}, err
+	}
+	var item Admin
+	var passwordSet int
+	err := s.db.QueryRowContext(ctx, `
+SELECT a.username, a.role, a.status, a.created_at, a.updated_at,
+CASE WHEN a.password_hash <> '' THEN 1 ELSE 0 END AS password_set
+FROM admin_sessions s
+JOIN admins a ON a.username = s.admin_username
+WHERE s.session_id = ? AND s.expires_at >= ?
+`, strings.TrimSpace(sessionID), time.Now().Unix()).Scan(&item.Username, &item.Role, &item.Status, &item.CreatedAt, &item.UpdatedAt, &passwordSet)
+	if err != nil {
+		return Admin{}, err
+	}
+	if item.Status != 1 {
+		return Admin{}, errors.New("admin_disabled")
+	}
+	item.PasswordSet = passwordSet == 1
+	now := time.Now().Unix()
+	_, err = s.db.ExecContext(ctx, `
+UPDATE admin_sessions
+SET last_activity = ?, expires_at = ?
+WHERE session_id = ?
+`, now, now+int64(ttl.Seconds()), strings.TrimSpace(sessionID))
+	if err != nil {
+		return Admin{}, err
+	}
+	return item, nil
+}
+
+func (s *Store) DeleteAdminSession(ctx context.Context, sessionID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM admin_sessions WHERE session_id = ?`, strings.TrimSpace(sessionID))
 	return err
+}
+
+func (s *Store) ListAdminSessions(ctx context.Context, username string) ([]AdminSession, error) {
+	if err := s.cleanupExpiredSessions(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT session_id, admin_username, created_at, last_activity, expires_at, ip_address, original_ip_address, user_agent
+FROM admin_sessions
+WHERE admin_username = ?
+ORDER BY last_activity DESC
+`, strings.TrimSpace(username))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]AdminSession, 0)
+	for rows.Next() {
+		var item AdminSession
+		if err := rows.Scan(&item.SessionID, &item.Username, &item.CreatedAt, &item.LastActivity, &item.ExpiresAt, &item.IPAddress, &item.OriginalIP, &item.UserAgent); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func (s *Store) ListAudits(ctx context.Context, q AuditQuery) ([]map[string]any, error) {
@@ -345,11 +610,15 @@ func (s *Store) EnsureBootstrapUser(username, password string) error {
 	if count > 0 {
 		return nil
 	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return err
+	}
 	now := time.Now().Unix()
-	_, err := s.db.Exec(`
+	_, err = s.db.Exec(`
 INSERT INTO users (username, password, status, expires_at, quota_bytes, used_bytes, max_devices, created_at, updated_at)
 VALUES (?, ?, 1, 0, 0, 0, 1, ?, ?)
-`, username, password, now, now)
+`, username, hash, now, now)
 	return err
 }
 
@@ -360,50 +629,174 @@ func (s *Store) CreateUser(ctx context.Context, user User, password string) erro
 	if user.MaxDevices <= 0 {
 		user.MaxDevices = 1
 	}
+	hash, err := hashPassword(strings.TrimSpace(password))
+	if err != nil {
+		return err
+	}
 	now := time.Now().Unix()
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO users (username, password, status, expires_at, quota_bytes, used_bytes, max_devices, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-`, user.Username, password, 1, user.ExpiresAt, user.QuotaBytes, 0, user.MaxDevices, now, now)
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO users (username, password, status, expires_at, quota_bytes, used_bytes, max_devices, tag, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, strings.TrimSpace(user.Username), hash, 1, user.ExpiresAt, user.QuotaBytes, 0, user.MaxDevices, strings.TrimSpace(user.Tag), now, now)
 	return err
 }
 
-func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
+func (s *Store) ListUsers(ctx context.Context, q UserListQuery) (UserListResult, error) {
+	if q.Limit <= 0 || q.Limit > 200 {
+		q.Limit = 20
+	}
+	if q.Offset < 0 {
+		q.Offset = 0
+	}
+
+	clauses := []string{"1=1"}
+	args := make([]any, 0, 4)
+	if search := strings.TrimSpace(q.Search); search != "" {
+		clauses = append(clauses, "u.username LIKE ?")
+		args = append(args, "%"+search+"%")
+	}
+	if q.Status != nil {
+		clauses = append(clauses, "u.status = ?")
+		args = append(args, *q.Status)
+	}
+	if tag := strings.TrimSpace(q.Tag); tag != "" {
+		clauses = append(clauses, "u.tag = ?")
+		args = append(args, tag)
+	}
+	now := time.Now().Unix()
+	switch strings.TrimSpace(q.ExpireFilter) {
+	case "expired":
+		clauses = append(clauses, "u.expires_at > 0 AND u.expires_at < ?")
+		args = append(args, now)
+	case "expiring7":
+		clauses = append(clauses, "u.expires_at > 0 AND u.expires_at >= ? AND u.expires_at <= ?")
+		args = append(args, now, now+7*24*3600)
+	case "permanent":
+		clauses = append(clauses, "u.expires_at = 0")
+	}
+
+	where := strings.Join(clauses, " AND ")
+	var total int
+	countQuery := `SELECT COUNT(*) FROM users u WHERE ` + where
+	if err := s.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		return UserListResult{}, err
+	}
+
+	cutoff := time.Now().Add(-s.deviceWindow).Unix()
+	listArgs := make([]any, 0, len(args)+3)
+	listArgs = append(listArgs, cutoff)
+	listArgs = append(listArgs, args...)
+	listArgs = append(listArgs, q.Limit, q.Offset)
 	rows, err := s.db.QueryContext(ctx, `
 SELECT u.username, u.status, u.expires_at, u.quota_bytes, u.used_bytes, u.max_devices, u.created_at, u.updated_at,
+u.tag,
 COALESCE((SELECT COUNT(*) FROM active_ips a WHERE a.username = u.username AND a.last_seen >= ?), 0) AS active_ips
 FROM users u
+WHERE `+where+`
 ORDER BY u.created_at DESC
-`, time.Now().Add(-s.deviceWindow).Unix())
+LIMIT ? OFFSET ?
+`, listArgs...)
+	if err != nil {
+		return UserListResult{}, err
+	}
+	defer rows.Close()
+
+	items := make([]User, 0)
+	for rows.Next() {
+		var user User
+		if err := rows.Scan(&user.Username, &user.Status, &user.ExpiresAt, &user.QuotaBytes, &user.UsedBytes, &user.MaxDevices, &user.CreatedAt, &user.UpdatedAt, &user.Tag, &user.ActiveIPs); err != nil {
+			return UserListResult{}, err
+		}
+		items = append(items, user)
+	}
+	if err := rows.Err(); err != nil {
+		return UserListResult{}, err
+	}
+
+	return UserListResult{Items: items, Total: total, Offset: q.Offset, Limit: q.Limit}, nil
+}
+
+func (s *Store) GetUser(ctx context.Context, username string) (User, error) {
+	var user User
+	err := s.db.QueryRowContext(ctx, `
+SELECT u.username, u.status, u.expires_at, u.quota_bytes, u.used_bytes, u.max_devices, u.created_at, u.updated_at,
+u.tag,
+COALESCE((SELECT COUNT(*) FROM active_ips a WHERE a.username = u.username AND a.last_seen >= ?), 0) AS active_ips
+FROM users u
+WHERE u.username = ?
+`, time.Now().Add(-s.deviceWindow).Unix(), strings.TrimSpace(username)).
+		Scan(&user.Username, &user.Status, &user.ExpiresAt, &user.QuotaBytes, &user.UsedBytes, &user.MaxDevices, &user.CreatedAt, &user.UpdatedAt, &user.Tag, &user.ActiveIPs)
+	if err != nil {
+		return User{}, err
+	}
+	return user, nil
+}
+
+func (s *Store) DeleteUser(ctx context.Context, username string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	username = strings.TrimSpace(username)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM active_ips WHERE username = ?`, username); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM users WHERE username = ?`, username)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
+func (s *Store) SetUserTag(ctx context.Context, username, tag string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username_required")
+	}
+	now := time.Now().Unix()
+	result, err := s.db.ExecContext(ctx, `UPDATE users SET tag = ?, updated_at = ? WHERE username = ?`, strings.TrimSpace(tag), now, username)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) ListUserTags(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT tag FROM users WHERE TRIM(tag) <> '' ORDER BY tag ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	out := make([]User, 0)
+	tags := make([]string, 0)
 	for rows.Next() {
-		var u User
-		if err := rows.Scan(&u.Username, &u.Status, &u.ExpiresAt, &u.QuotaBytes, &u.UsedBytes, &u.MaxDevices, &u.CreatedAt, &u.UpdatedAt, &u.ActiveIPs); err != nil {
+		var tag string
+		if err := rows.Scan(&tag); err != nil {
 			return nil, err
 		}
-		out = append(out, u)
+		tags = append(tags, tag)
 	}
-	return out, rows.Err()
-}
-
-func (s *Store) GetUser(ctx context.Context, username string) (User, error) {
-	var u User
-	err := s.db.QueryRowContext(ctx, `
-SELECT u.username, u.status, u.expires_at, u.quota_bytes, u.used_bytes, u.max_devices, u.created_at, u.updated_at,
-COALESCE((SELECT COUNT(*) FROM active_ips a WHERE a.username = u.username AND a.last_seen >= ?), 0) AS active_ips
-FROM users u
-WHERE u.username = ?
-`, time.Now().Add(-s.deviceWindow).Unix(), username).
-		Scan(&u.Username, &u.Status, &u.ExpiresAt, &u.QuotaBytes, &u.UsedBytes, &u.MaxDevices, &u.CreatedAt, &u.UpdatedAt, &u.ActiveIPs)
-	if err != nil {
-		return User{}, err
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	return u, nil
+	return tags, nil
 }
 
 func (s *Store) SetUserStatus(ctx context.Context, username string, enabled bool) error {
@@ -411,7 +804,75 @@ func (s *Store) SetUserStatus(ctx context.Context, username string, enabled bool
 	if enabled {
 		status = 1
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE users SET status = ?, updated_at = ? WHERE username = ?`, status, time.Now().Unix(), username)
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET status = ?, updated_at = ? WHERE username = ?`, status, time.Now().Unix(), strings.TrimSpace(username))
+	return err
+}
+
+func (s *Store) BatchSetUserStatus(ctx context.Context, usernames []string, enabled bool) (int64, error) {
+	if len(usernames) == 0 {
+		return 0, nil
+	}
+	status := 0
+	if enabled {
+		status = 1
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `UPDATE users SET status = ?, updated_at = ? WHERE username = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+
+	var total int64
+	now := time.Now().Unix()
+	for _, username := range usernames {
+		result, err := stmt.ExecContext(ctx, status, now, strings.TrimSpace(username))
+		if err != nil {
+			return 0, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		total += affected
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+func (s *Store) SetUserMaxDevices(ctx context.Context, username string, maxDevices int) error {
+	if maxDevices <= 0 {
+		return errors.New("max_devices must be > 0")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET max_devices = ?, updated_at = ? WHERE username = ?`, maxDevices, time.Now().Unix(), strings.TrimSpace(username))
+	return err
+}
+
+func (s *Store) SetUserPassword(ctx context.Context, username, password string) error {
+	username = strings.TrimSpace(username)
+	password = strings.TrimSpace(password)
+	if username == "" || password == "" {
+		return errors.New("username and password are required")
+	}
+	hash, err := hashPassword(password)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE users SET password = ?, updated_at = ? WHERE username = ?`, hash, time.Now().Unix(), username)
+	return err
+}
+
+func (s *Store) ResetUserUsage(ctx context.Context, username string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET used_bytes = 0, updated_at = ? WHERE username = ?`, time.Now().Unix(), strings.TrimSpace(username))
 	return err
 }
 
@@ -421,7 +882,7 @@ func (s *Store) ExtendUserDays(ctx context.Context, username string, days int) e
 	}
 	now := time.Now().Unix()
 	var expires int64
-	if err := s.db.QueryRowContext(ctx, `SELECT expires_at FROM users WHERE username = ?`, username).Scan(&expires); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT expires_at FROM users WHERE username = ?`, strings.TrimSpace(username)).Scan(&expires); err != nil {
 		return err
 	}
 	base := expires
@@ -429,7 +890,7 @@ func (s *Store) ExtendUserDays(ctx context.Context, username string, days int) e
 		base = now
 	}
 	next := base + int64(days)*24*3600
-	_, err := s.db.ExecContext(ctx, `UPDATE users SET expires_at = ?, updated_at = ? WHERE username = ?`, next, now, username)
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET expires_at = ?, updated_at = ? WHERE username = ?`, next, now, strings.TrimSpace(username))
 	return err
 }
 
@@ -437,7 +898,7 @@ func (s *Store) TopUpQuota(ctx context.Context, username string, bytes int64) er
 	if bytes <= 0 {
 		return errors.New("bytes must be > 0")
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE users SET quota_bytes = quota_bytes + ?, updated_at = ? WHERE username = ?`, bytes, time.Now().Unix(), username)
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET quota_bytes = quota_bytes + ?, updated_at = ? WHERE username = ?`, bytes, time.Now().Unix(), strings.TrimSpace(username))
 	return err
 }
 
@@ -445,7 +906,35 @@ func (s *Store) AddUsage(ctx context.Context, username string, bytes int64) erro
 	if bytes <= 0 {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE users SET used_bytes = used_bytes + ?, updated_at = ? WHERE username = ?`, bytes, time.Now().Unix(), username)
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET used_bytes = used_bytes + ?, updated_at = ? WHERE username = ?`, bytes, time.Now().Unix(), strings.TrimSpace(username))
+	return err
+}
+
+func (s *Store) ListUserDevices(ctx context.Context, username string) ([]UserDevice, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT ip, last_seen
+FROM active_ips
+WHERE username = ? AND last_seen >= ?
+ORDER BY last_seen DESC
+`, strings.TrimSpace(username), time.Now().Add(-s.deviceWindow).Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]UserDevice, 0)
+	for rows.Next() {
+		var item UserDevice
+		if err := rows.Scan(&item.IP, &item.LastSeen); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) DeleteUserDevice(ctx context.Context, username, ip string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM active_ips WHERE username = ? AND ip = ?`, strings.TrimSpace(username), strings.TrimSpace(ip))
 	return err
 }
 
@@ -483,15 +972,25 @@ func (s *Store) Authorize(username, password, sourceIP string) (bool, string, er
 SELECT password, status, expires_at, quota_bytes, used_bytes, max_devices
 FROM users
 WHERE username = ?
-`, username).Scan(&storedPassword, &status, &expiresAt, &quotaBytes, &usedBytes, &maxDevices); err != nil {
+`, strings.TrimSpace(username)).Scan(&storedPassword, &status, &expiresAt, &quotaBytes, &usedBytes, &maxDevices); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, "user_not_found", nil
 		}
 		return false, "internal_error", err
 	}
 
-	if subtle.ConstantTimeCompare([]byte(storedPassword), []byte(password)) != 1 {
+	ok, needsUpgrade := verifyStoredPassword(storedPassword, password)
+	if !ok {
 		return false, "invalid_password", nil
+	}
+	if needsUpgrade {
+		hash, err := hashPassword(password)
+		if err != nil {
+			return false, "internal_error", err
+		}
+		if _, err := tx.Exec(`UPDATE users SET password = ?, updated_at = ? WHERE username = ?`, hash, now, strings.TrimSpace(username)); err != nil {
+			return false, "internal_error", err
+		}
 	}
 	if status != 1 {
 		return false, "user_disabled", nil
@@ -507,15 +1006,15 @@ WHERE username = ?
 	}
 
 	var existing int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM active_ips WHERE username = ? AND ip = ?`, username, sourceIP).Scan(&existing); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM active_ips WHERE username = ? AND ip = ?`, strings.TrimSpace(username), strings.TrimSpace(sourceIP)).Scan(&existing); err != nil {
 		return false, "internal_error", err
 	}
 	if existing == 0 {
-		var cnt int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM active_ips WHERE username = ?`, username).Scan(&cnt); err != nil {
+		var count int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM active_ips WHERE username = ?`, strings.TrimSpace(username)).Scan(&count); err != nil {
 			return false, "internal_error", err
 		}
-		if cnt >= maxDevices {
+		if count >= maxDevices {
 			return false, "device_limit", nil
 		}
 	}
@@ -524,7 +1023,7 @@ WHERE username = ?
 INSERT INTO active_ips(username, ip, last_seen)
 VALUES (?, ?, ?)
 ON CONFLICT(username, ip) DO UPDATE SET last_seen = excluded.last_seen
-`, username, sourceIP, now); err != nil {
+`, strings.TrimSpace(username), strings.TrimSpace(sourceIP), now); err != nil {
 		return false, "internal_error", err
 	}
 
@@ -535,9 +1034,9 @@ ON CONFLICT(username, ip) DO UPDATE SET last_seen = excluded.last_seen
 }
 
 func (s *Store) MustGetUser(ctx context.Context, username string) (User, error) {
-	u, err := s.GetUser(ctx, username)
+	user, err := s.GetUser(ctx, username)
 	if err != nil {
 		return User{}, fmt.Errorf("get user %s: %w", username, err)
 	}
-	return u, nil
+	return user, nil
 }

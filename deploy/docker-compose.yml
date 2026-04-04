@@ -17,12 +17,15 @@ services:
       DIAL_TIMEOUT: 15s
       CONTROL_PLANE_ENABLED: "true"
       DB_PATH: /app/data/proxy.db
-      ADMIN_TOKEN: change-me
-      READONLY_ADMIN_TOKEN: readonly-change-me
       DEVICE_WINDOW: 10m
-      BOOTSTRAP_USER: admin
-      BOOTSTRAP_PASS: admin123
+      BOOTSTRAP_USER: vpn
+      BOOTSTRAP_PASS: abc123456
+      BOOTSTRAP_ADMIN_USER: admin
+      BOOTSTRAP_ADMIN_PASS: StrongAdmin123
       BOOTSTRAP_READONLY: ops
+      BOOTSTRAP_READONLY_PASS: OpsPass123
+      ADMIN_SESSION_TTL: 12h
+      PASSWORD_MIN_LENGTH: 8
     mem_limit: 256m
     cpus: 1.00
     volumes:
