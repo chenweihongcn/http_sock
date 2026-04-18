@@ -18,6 +18,7 @@ type Config struct {
 	Users               map[string]string
 	ControlPlaneEnabled bool
 	DBPath              string
+	SMBRootDir          string
 	DeviceWindow        time.Duration
 	BootstrapUser       string
 	BootstrapPass       string
@@ -28,6 +29,15 @@ type Config struct {
 	AdminSessionTTL     time.Duration
 	AdminCookieSecure   bool
 	PasswordMinLength   int
+	AdminRateLimitRPS   int
+	AdminRateLimitBurst int
+	AdminLoginMaxFails  int
+	AdminLoginBlockFor  time.Duration
+	AdminLoginFailWindow time.Duration
+	AdminUIAlertRateLimitDelta int
+	AdminUIAlertLoginFailDelta int
+	AdminUIAlertLoginBlockDelta int
+	AdminUIAlertCooldown time.Duration
 }
 
 func LoadFromEnv() Config {
@@ -42,6 +52,7 @@ func LoadFromEnv() Config {
 		Users:               parseUsers(getEnv("PROXY_USERS", "admin:admin123")),
 		ControlPlaneEnabled: getEnvBool("CONTROL_PLANE_ENABLED", true),
 		DBPath:              getEnv("DB_PATH", "./data/proxy.db"),
+		SMBRootDir:          getEnv("SMB_ROOT_DIR", "/mnt/mmc0-4/proxy-platform/smb"),
 		DeviceWindow:        getEnvDuration("DEVICE_WINDOW", 10*time.Minute),
 		BootstrapUser:       getEnv("BOOTSTRAP_USER", "admin"),
 		BootstrapPass:       getEnv("BOOTSTRAP_PASS", "admin123"),
@@ -52,6 +63,15 @@ func LoadFromEnv() Config {
 		AdminSessionTTL:     getEnvDuration("ADMIN_SESSION_TTL", 12*time.Hour),
 		AdminCookieSecure:   getEnvBool("ADMIN_COOKIE_SECURE", false),
 		PasswordMinLength:   getEnvInt("PASSWORD_MIN_LENGTH", 8),
+		AdminRateLimitRPS:   getEnvInt("ADMIN_RATE_LIMIT_RPS", 20),
+		AdminRateLimitBurst: getEnvInt("ADMIN_RATE_LIMIT_BURST", 60),
+		AdminLoginMaxFails:  getEnvInt("ADMIN_LOGIN_MAX_FAILS", 8),
+		AdminLoginBlockFor:  getEnvDuration("ADMIN_LOGIN_BLOCK_FOR", 15*time.Minute),
+		AdminLoginFailWindow: getEnvDuration("ADMIN_LOGIN_FAIL_WINDOW", 15*time.Minute),
+		AdminUIAlertRateLimitDelta: getEnvInt("ADMIN_UI_ALERT_RATE_LIMIT_DELTA", 3),
+		AdminUIAlertLoginFailDelta: getEnvInt("ADMIN_UI_ALERT_LOGIN_FAIL_DELTA", 5),
+		AdminUIAlertLoginBlockDelta: getEnvInt("ADMIN_UI_ALERT_LOGIN_BLOCK_DELTA", 1),
+		AdminUIAlertCooldown: getEnvDuration("ADMIN_UI_ALERT_COOLDOWN", 5*time.Minute),
 	}
 	return cfg
 }

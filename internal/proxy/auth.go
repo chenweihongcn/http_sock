@@ -5,11 +5,12 @@ import (
 )
 
 type Authenticator interface {
-	Validate(username, password, sourceIP string) bool
+	Validate(username, password, sourceIP, clientAgent string) bool
 }
 
 type UsageRecorder interface {
 	RecordUsage(username string, bytes int64)
+	SpeedLimitBytesPerSec(username string) int64
 }
 
 type StaticAuthenticator struct {
@@ -24,7 +25,9 @@ func NewStaticAuthenticator(users map[string]string) *StaticAuthenticator {
 	return &StaticAuthenticator{users: copyUsers}
 }
 
-func (a *StaticAuthenticator) Validate(username, password, sourceIP string) bool {
+func (a *StaticAuthenticator) Validate(username, password, sourceIP, clientAgent string) bool {
+	_ = sourceIP
+	_ = clientAgent
 	expected, ok := a.users[username]
 	if !ok {
 		return false
@@ -35,6 +38,11 @@ func (a *StaticAuthenticator) Validate(username, password, sourceIP string) bool
 func (a *StaticAuthenticator) RecordUsage(username string, bytes int64) {
 	_ = username
 	_ = bytes
+}
+
+func (a *StaticAuthenticator) SpeedLimitBytesPerSec(username string) int64 {
+	_ = username
+	return 0
 }
 
 func (a *StaticAuthenticator) Enabled() bool {

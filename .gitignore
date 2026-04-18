@@ -21,3 +21,6 @@ login.json
 new-admin*.json
 new-admin*.cookie
 admin.cookie
+
+# Local Windows SSH helper tools (keep local, do not commit)
+tools/*.exe

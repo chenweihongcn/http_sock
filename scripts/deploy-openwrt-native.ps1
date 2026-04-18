@@ -95,7 +95,7 @@ try {
         $pscp = Join-Path $workspace "tools\pscp.exe"
         $plink = Join-Path $workspace "tools\plink.exe"
         if (-not (Test-Path $pscp) -or -not (Test-Path $plink)) {
-            throw "password mode requires tools\\pscp.exe and tools\\plink.exe"
+          throw "password mode requires local tools\\pscp.exe and tools\\plink.exe (download from official PuTTY release and keep them out of git)"
         }
 
         Write-Step "Upload binary (password mode)"
@@ -112,6 +112,7 @@ SOCKS5_PORT=1080
 ADMIN_PORT=8088
 CONTROL_PLANE_ENABLED=true
 DB_PATH=${remoteDb}
+SMB_ROOT_DIR=/mnt/mmc0-4/proxy-platform/smb
 DEVICE_WINDOW=10m
 BOOTSTRAP_ADMIN_USER=${AdminUser}
 BOOTSTRAP_ADMIN_PASS=${AdminPassword}
@@ -185,6 +186,7 @@ SOCKS5_PORT=1080
 ADMIN_PORT=8088
 CONTROL_PLANE_ENABLED=true
 DB_PATH=${remoteDb}
+SMB_ROOT_DIR=/mnt/mmc0-4/proxy-platform/smb
 DEVICE_WINDOW=10m
 BOOTSTRAP_ADMIN_USER=${AdminUser}
 BOOTSTRAP_ADMIN_PASS=${AdminPassword}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"path/filepath"
 	"strings"
 	"time"
@@ -24,15 +25,21 @@ type User struct {
 	ExpiresAt  int64  `json:"expires_at"`
 	QuotaBytes int64  `json:"quota_bytes"`
 	UsedBytes  int64  `json:"used_bytes"`
-	MaxDevices int    `json:"max_devices"`
+	SMBEnabled   int   `json:"smb_enabled"`
+	SMBQuotaBytes int64 `json:"smb_quota_bytes"`
+	SMBUsedBytes  int64 `json:"smb_used_bytes"`
+	SpeedLimitKbps int64 `json:"speed_limit_kbps"`
+	MaxDevices int     `json:"max_devices"`
 	CreatedAt  int64  `json:"created_at"`
 	UpdatedAt  int64  `json:"updated_at"`
 	ActiveIPs  int    `json:"active_ips"`
 }
 
 type UserDevice struct {
-	IP       string `json:"ip"`
-	LastSeen int64  `json:"last_seen"`
+	IP        string `json:"ip"`
+	FirstSeen int64  `json:"first_seen"`
+	LastSeen  int64  `json:"last_seen"`
+	UserAgent string `json:"user_agent"`
 }
 
 type UserListQuery struct {
@@ -90,6 +97,19 @@ type Store struct {
 	deviceWindow time.Duration
 }
 
+var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`)
+
+func normalizeUsername(raw string) (string, error) {
+	username := strings.TrimSpace(raw)
+	if username == "" {
+		return "", errors.New("username_required")
+	}
+	if !usernamePattern.MatchString(username) {
+		return "", errors.New("invalid_username_format")
+	}
+	return username, nil
+}
+
 func NewStore(dbPath string, deviceWindow time.Duration) (*Store, error) {
 	dir := filepath.Dir(dbPath)
 	if dir != "." {
@@ -138,6 +158,10 @@ CREATE TABLE IF NOT EXISTS users (
   expires_at INTEGER NOT NULL DEFAULT 0,
   quota_bytes INTEGER NOT NULL DEFAULT 0,
   used_bytes INTEGER NOT NULL DEFAULT 0,
+	smb_enabled INTEGER NOT NULL DEFAULT 0,
+	smb_quota_bytes INTEGER NOT NULL DEFAULT 0,
+	smb_used_bytes INTEGER NOT NULL DEFAULT 0,
+	speed_limit_kbps INTEGER NOT NULL DEFAULT 0,
   max_devices INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -146,6 +170,8 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS active_ips (
   username TEXT NOT NULL,
   ip TEXT NOT NULL,
+	user_agent TEXT NOT NULL DEFAULT '',
+	first_seen INTEGER NOT NULL DEFAULT 0,
   last_seen INTEGER NOT NULL,
   PRIMARY KEY(username, ip)
 );
@@ -193,6 +219,27 @@ CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expir
 		return err
 	}
 	if err := s.ensureColumn("users", "tag", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("users", "smb_enabled", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("users", "smb_quota_bytes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("users", "smb_used_bytes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("users", "speed_limit_kbps", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("active_ips", "user_agent", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("active_ips", "first_seen", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`UPDATE active_ips SET first_seen = last_seen WHERE first_seen = 0`); err != nil {
 		return err
 	}
 	if err := s.ensureColumn("admin_sessions", "original_ip_address", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -275,6 +322,10 @@ func normalizeAdminRole(role string) (string, error) {
 func (s *Store) EnsureBootstrapAdmins(superUser, superPassword, readonlyUser, readonlyPassword string) error {
 	now := time.Now().Unix()
 	if strings.TrimSpace(superUser) != "" && strings.TrimSpace(superPassword) != "" {
+		normalizedSuperUser, err := normalizeUsername(superUser)
+		if err != nil {
+			return fmt.Errorf("invalid_bootstrap_admin_user: %w", err)
+		}
 		hash, err := hashPassword(strings.TrimSpace(superPassword))
 		if err != nil {
 			return err
@@ -283,12 +334,16 @@ func (s *Store) EnsureBootstrapAdmins(superUser, superPassword, readonlyUser, re
 INSERT INTO admins(username, token, password_hash, role, status, created_at, updated_at)
 VALUES (?, ?, ?, 'super', 1, ?, ?)
 ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash, role = excluded.role, status = 1, updated_at = excluded.updated_at
-`, strings.TrimSpace(superUser), disabledToken(), hash, now, now); err != nil {
+`, normalizedSuperUser, disabledToken(), hash, now, now); err != nil {
 			return err
 		}
 	}
 
 	if strings.TrimSpace(readonlyUser) != "" && strings.TrimSpace(readonlyPassword) != "" {
+		normalizedReadonlyUser, err := normalizeUsername(readonlyUser)
+		if err != nil {
+			return fmt.Errorf("invalid_bootstrap_readonly_user: %w", err)
+		}
 		hash, err := hashPassword(strings.TrimSpace(readonlyPassword))
 		if err != nil {
 			return err
@@ -297,7 +352,7 @@ ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash, role
 INSERT INTO admins(username, token, password_hash, role, status, created_at, updated_at)
 VALUES (?, ?, ?, 'readonly', 1, ?, ?)
 ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash, role = excluded.role, status = 1, updated_at = excluded.updated_at
-`, strings.TrimSpace(readonlyUser), disabledToken(), hash, now, now); err != nil {
+`, normalizedReadonlyUser, disabledToken(), hash, now, now); err != nil {
 			return err
 		}
 	}
@@ -362,9 +417,13 @@ ORDER BY created_at DESC
 }
 
 func (s *Store) CreateAdmin(ctx context.Context, username, password, role string) error {
-	username = strings.TrimSpace(username)
+	var err error
+	username, err = normalizeUsername(username)
+	if err != nil {
+		return err
+	}
 	password = strings.TrimSpace(password)
-	if username == "" || password == "" {
+	if password == "" {
 		return errors.New("username and password are required")
 	}
 	normalizedRole, err := normalizeAdminRole(role)
@@ -598,9 +657,13 @@ LIMIT ?
 }
 
 func (s *Store) EnsureBootstrapUser(username, password string) error {
-	username = strings.TrimSpace(username)
+	var err error
+	username, err = normalizeUsername(username)
+	if err != nil {
+		return fmt.Errorf("invalid_bootstrap_user: %w", err)
+	}
 	password = strings.TrimSpace(password)
-	if username == "" || password == "" {
+	if password == "" {
 		return nil
 	}
 	var count int
@@ -616,14 +679,18 @@ func (s *Store) EnsureBootstrapUser(username, password string) error {
 	}
 	now := time.Now().Unix()
 	_, err = s.db.Exec(`
-INSERT INTO users (username, password, status, expires_at, quota_bytes, used_bytes, max_devices, created_at, updated_at)
-VALUES (?, ?, 1, 0, 0, 0, 1, ?, ?)
+INSERT INTO users (username, password, status, expires_at, quota_bytes, used_bytes, smb_enabled, smb_quota_bytes, smb_used_bytes, speed_limit_kbps, max_devices, created_at, updated_at)
+VALUES (?, ?, 1, 0, 0, 0, 0, 0, 0, 0, 1, ?, ?)
 `, username, hash, now, now)
 	return err
 }
 
 func (s *Store) CreateUser(ctx context.Context, user User, password string) error {
-	if strings.TrimSpace(user.Username) == "" || strings.TrimSpace(password) == "" {
+	username, err := normalizeUsername(user.Username)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(password) == "" {
 		return errors.New("username and password are required")
 	}
 	if user.MaxDevices <= 0 {
@@ -635,9 +702,9 @@ func (s *Store) CreateUser(ctx context.Context, user User, password string) erro
 	}
 	now := time.Now().Unix()
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO users (username, password, status, expires_at, quota_bytes, used_bytes, max_devices, tag, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`, strings.TrimSpace(user.Username), hash, 1, user.ExpiresAt, user.QuotaBytes, 0, user.MaxDevices, strings.TrimSpace(user.Tag), now, now)
+INSERT INTO users (username, password, status, expires_at, quota_bytes, used_bytes, smb_enabled, smb_quota_bytes, smb_used_bytes, speed_limit_kbps, max_devices, tag, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, username, hash, 1, user.ExpiresAt, user.QuotaBytes, 0, user.SMBEnabled, user.SMBQuotaBytes, 0, user.SpeedLimitKbps, user.MaxDevices, strings.TrimSpace(user.Tag), now, now)
 	return err
 }
 
@@ -688,7 +755,7 @@ func (s *Store) ListUsers(ctx context.Context, q UserListQuery) (UserListResult,
 	listArgs = append(listArgs, args...)
 	listArgs = append(listArgs, q.Limit, q.Offset)
 	rows, err := s.db.QueryContext(ctx, `
-SELECT u.username, u.status, u.expires_at, u.quota_bytes, u.used_bytes, u.max_devices, u.created_at, u.updated_at,
+SELECT u.username, u.status, u.expires_at, u.quota_bytes, u.used_bytes, u.smb_enabled, u.smb_quota_bytes, u.smb_used_bytes, u.speed_limit_kbps, u.max_devices, u.created_at, u.updated_at,
 u.tag,
 COALESCE((SELECT COUNT(*) FROM active_ips a WHERE a.username = u.username AND a.last_seen >= ?), 0) AS active_ips
 FROM users u
@@ -704,7 +771,7 @@ LIMIT ? OFFSET ?
 	items := make([]User, 0)
 	for rows.Next() {
 		var user User
-		if err := rows.Scan(&user.Username, &user.Status, &user.ExpiresAt, &user.QuotaBytes, &user.UsedBytes, &user.MaxDevices, &user.CreatedAt, &user.UpdatedAt, &user.Tag, &user.ActiveIPs); err != nil {
+		if err := rows.Scan(&user.Username, &user.Status, &user.ExpiresAt, &user.QuotaBytes, &user.UsedBytes, &user.SMBEnabled, &user.SMBQuotaBytes, &user.SMBUsedBytes, &user.SpeedLimitKbps, &user.MaxDevices, &user.CreatedAt, &user.UpdatedAt, &user.Tag, &user.ActiveIPs); err != nil {
 			return UserListResult{}, err
 		}
 		items = append(items, user)
@@ -719,13 +786,13 @@ LIMIT ? OFFSET ?
 func (s *Store) GetUser(ctx context.Context, username string) (User, error) {
 	var user User
 	err := s.db.QueryRowContext(ctx, `
-SELECT u.username, u.status, u.expires_at, u.quota_bytes, u.used_bytes, u.max_devices, u.created_at, u.updated_at,
+SELECT u.username, u.status, u.expires_at, u.quota_bytes, u.used_bytes, u.smb_enabled, u.smb_quota_bytes, u.smb_used_bytes, u.speed_limit_kbps, u.max_devices, u.created_at, u.updated_at,
 u.tag,
 COALESCE((SELECT COUNT(*) FROM active_ips a WHERE a.username = u.username AND a.last_seen >= ?), 0) AS active_ips
 FROM users u
 WHERE u.username = ?
 `, time.Now().Add(-s.deviceWindow).Unix(), strings.TrimSpace(username)).
-		Scan(&user.Username, &user.Status, &user.ExpiresAt, &user.QuotaBytes, &user.UsedBytes, &user.MaxDevices, &user.CreatedAt, &user.UpdatedAt, &user.Tag, &user.ActiveIPs)
+		Scan(&user.Username, &user.Status, &user.ExpiresAt, &user.QuotaBytes, &user.UsedBytes, &user.SMBEnabled, &user.SMBQuotaBytes, &user.SMBUsedBytes, &user.SpeedLimitKbps, &user.MaxDevices, &user.CreatedAt, &user.UpdatedAt, &user.Tag, &user.ActiveIPs)
 	if err != nil {
 		return User{}, err
 	}
@@ -902,6 +969,118 @@ func (s *Store) TopUpQuota(ctx context.Context, username string, bytes int64) er
 	return err
 }
 
+func (s *Store) TopUpSMBQuota(ctx context.Context, username string, bytes int64) error {
+	if bytes <= 0 {
+		return errors.New("bytes must be > 0")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE users SET smb_quota_bytes = smb_quota_bytes + ?, updated_at = ? WHERE username = ? AND smb_enabled = 1`, bytes, time.Now().Unix(), strings.TrimSpace(username))
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errors.New("smb_not_enabled_or_user_not_found")
+	}
+	return nil
+}
+
+func (s *Store) SetUserQuota(ctx context.Context, username string, bytes int64) error {
+	if bytes < 0 {
+		return errors.New("bytes must be >= 0")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET quota_bytes = ?, updated_at = ? WHERE username = ?`, bytes, time.Now().Unix(), strings.TrimSpace(username))
+	return err
+}
+
+func (s *Store) SetUserSMBQuota(ctx context.Context, username string, bytes int64) error {
+	if bytes < 0 {
+		return errors.New("bytes must be >= 0")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET smb_quota_bytes = ?, updated_at = ? WHERE username = ?`, bytes, time.Now().Unix(), strings.TrimSpace(username))
+	return err
+}
+
+func (s *Store) SetUserSpeedLimitKbps(ctx context.Context, username string, kbps int64) error {
+	if kbps < 0 {
+		return errors.New("kbps must be >= 0")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE users SET speed_limit_kbps = ?, updated_at = ? WHERE username = ?`, kbps, time.Now().Unix(), strings.TrimSpace(username))
+	return err
+}
+
+func (s *Store) GetUserSpeedLimitBytesPerSec(ctx context.Context, username string) int64 {
+	var kbps int64
+	err := s.db.QueryRowContext(ctx, `SELECT speed_limit_kbps FROM users WHERE username = ?`, strings.TrimSpace(username)).Scan(&kbps)
+	if err != nil || kbps <= 0 {
+		return 0
+	}
+	return kbps * 1024
+}
+
+func (s *Store) AuthenticateUserPassword(ctx context.Context, username, password string) (User, error) {
+	username = strings.TrimSpace(username)
+	password = strings.TrimSpace(password)
+	if username == "" || password == "" {
+		return User{}, errors.New("invalid_credentials")
+	}
+
+	var storedPassword string
+	var user User
+	err := s.db.QueryRowContext(ctx, `
+SELECT password, username, tag, status, expires_at, quota_bytes, used_bytes, smb_enabled, smb_quota_bytes, smb_used_bytes, max_devices, created_at, updated_at
+FROM users
+WHERE username = ?
+`, username).Scan(&storedPassword, &user.Username, &user.Tag, &user.Status, &user.ExpiresAt, &user.QuotaBytes, &user.UsedBytes, &user.SMBEnabled, &user.SMBQuotaBytes, &user.SMBUsedBytes, &user.MaxDevices, &user.CreatedAt, &user.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, errors.New("invalid_credentials")
+		}
+		return User{}, err
+	}
+
+	ok, needsUpgrade := verifyStoredPassword(storedPassword, password)
+	if !ok {
+		return User{}, errors.New("invalid_credentials")
+	}
+	if needsUpgrade {
+		hash, err := hashPassword(password)
+		if err == nil {
+			_, _ = s.db.ExecContext(ctx, `UPDATE users SET password = ?, updated_at = ? WHERE username = ?`, hash, time.Now().Unix(), username)
+		}
+	}
+
+	now := time.Now().Unix()
+	if user.Status != 1 {
+		return User{}, errors.New("user_disabled")
+	}
+	if user.ExpiresAt > 0 && now > user.ExpiresAt {
+		return User{}, errors.New("expired")
+	}
+	return user, nil
+}
+
+func (s *Store) SetUserSMBEnabled(ctx context.Context, username string, enabled bool) error {
+	value := 0
+	if enabled {
+		value = 1
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE users SET smb_enabled = ?, updated_at = ? WHERE username = ?`, value, time.Now().Unix(), strings.TrimSpace(username))
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Store) AddUsage(ctx context.Context, username string, bytes int64) error {
 	if bytes <= 0 {
 		return nil
@@ -912,7 +1091,7 @@ func (s *Store) AddUsage(ctx context.Context, username string, bytes int64) erro
 
 func (s *Store) ListUserDevices(ctx context.Context, username string) ([]UserDevice, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT ip, last_seen
+SELECT ip, first_seen, last_seen, user_agent
 FROM active_ips
 WHERE username = ? AND last_seen >= ?
 ORDER BY last_seen DESC
@@ -925,7 +1104,7 @@ ORDER BY last_seen DESC
 	items := make([]UserDevice, 0)
 	for rows.Next() {
 		var item UserDevice
-		if err := rows.Scan(&item.IP, &item.LastSeen); err != nil {
+		if err := rows.Scan(&item.IP, &item.FirstSeen, &item.LastSeen, &item.UserAgent); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -946,7 +1125,7 @@ VALUES (?, ?, ?, ?, ?)
 	return err
 }
 
-func (s *Store) Authorize(username, password, sourceIP string) (bool, string, error) {
+func (s *Store) Authorize(username, password, sourceIP, clientAgent string) (bool, string, error) {
 	now := time.Now().Unix()
 	cutoff := time.Now().Add(-s.deviceWindow).Unix()
 
@@ -1020,10 +1199,13 @@ WHERE username = ?
 	}
 
 	if _, err := tx.Exec(`
-INSERT INTO active_ips(username, ip, last_seen)
-VALUES (?, ?, ?)
-ON CONFLICT(username, ip) DO UPDATE SET last_seen = excluded.last_seen
-`, strings.TrimSpace(username), strings.TrimSpace(sourceIP), now); err != nil {
+INSERT INTO active_ips(username, ip, user_agent, first_seen, last_seen)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(username, ip) DO UPDATE SET
+	user_agent = excluded.user_agent,
+	first_seen = CASE WHEN active_ips.first_seen > 0 THEN active_ips.first_seen ELSE excluded.first_seen END,
+	last_seen = excluded.last_seen
+`, strings.TrimSpace(username), strings.TrimSpace(sourceIP), strings.TrimSpace(clientAgent), now, now); err != nil {
 		return false, "internal_error", err
 	}
 

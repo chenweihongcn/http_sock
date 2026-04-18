@@ -154,7 +154,7 @@ func (s *SOCKS5Server) handleUserPassAuth(conn net.Conn, sourceIP string) (strin
 	}
 
 	username := string(uname)
-	if !s.auth.Validate(username, string(passwd), sourceIP) {
+	if !s.auth.Validate(username, string(passwd), sourceIP, "SOCKS5 客户端") {
 		_, _ = conn.Write([]byte{socksUserPassVersion, 0x01})
 		return "", errors.New("authentication failed")
 	}
@@ -195,7 +195,7 @@ func (s *SOCKS5Server) handleConnect(conn net.Conn, username string) error {
 	_ = conn.SetDeadline(time.Time{})
 	tunnelWithUsage(conn, remote, func(total int64) {
 		s.recordUsage(username, total)
-	})
+	}, s.speedLimitBPS(username))
 	return nil
 }
 
@@ -251,4 +251,11 @@ func (s *SOCKS5Server) recordUsage(username string, bytes int64) {
 		return
 	}
 	s.usage.RecordUsage(username, bytes)
+}
+
+func (s *SOCKS5Server) speedLimitBPS(username string) int64 {
+	if s.usage == nil || username == "" {
+		return 0
+	}
+	return s.usage.SpeedLimitBytesPerSec(username)
 }

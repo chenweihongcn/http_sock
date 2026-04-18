@@ -2,7 +2,10 @@ module http-proxy-platform
 
 go 1.22
 
-require modernc.org/sqlite v1.33.1
+require (
+	golang.org/x/net v0.21.0
+	modernc.org/sqlite v1.33.1
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

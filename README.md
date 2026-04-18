@@ -63,6 +63,7 @@ docker compose -f deploy/docker-compose.yml up -d --build
 - `DIAL_TIMEOUT`：出站拨号超时，默认 `15s`
 - `CONTROL_PLANE_ENABLED`：是否启用 SQLite 控制平面，默认 `true`
 - `DB_PATH`：SQLite 文件路径，默认 `./data/proxy.db`
+- `SMB_ROOT_DIR`：SMB 用户目录根路径，默认 `/mnt/mmc0-4/proxy-platform/smb`
 - `DEVICE_WINDOW`：设备数统计窗口，默认 `10m`
 - `BOOTSTRAP_USER`：数据库为空时自动创建的第一个代理用户
 - `BOOTSTRAP_PASS`：第一个代理用户密码
@@ -73,6 +74,15 @@ docker compose -f deploy/docker-compose.yml up -d --build
 - `ADMIN_SESSION_TTL`：管理员会话时长，默认 `12h`
 - `ADMIN_COOKIE_SECURE`：是否给管理 Cookie 打上 `Secure` 标记，默认 `false`
 - `PASSWORD_MIN_LENGTH`：后台设置密码时的最小长度，默认 `8`
+- `ADMIN_RATE_LIMIT_RPS`：管理 API 每个客户端 IP 的速率上限（请求/秒），默认 `20`
+- `ADMIN_RATE_LIMIT_BURST`：管理 API 每个客户端 IP 的突发桶容量，默认 `60`
+- `ADMIN_LOGIN_MAX_FAILS`：登录失败触发临时封禁的阈值，默认 `8`
+- `ADMIN_LOGIN_FAIL_WINDOW`：登录失败计数窗口，默认 `15m`
+- `ADMIN_LOGIN_BLOCK_FOR`：达到阈值后的封禁时长，默认 `15m`
+- `ADMIN_UI_ALERT_RATE_LIMIT_DELTA`：管理台限流告警增量阈值，默认 `3`
+- `ADMIN_UI_ALERT_LOGIN_FAIL_DELTA`：管理台登录失败告警增量阈值，默认 `5`
+- `ADMIN_UI_ALERT_LOGIN_BLOCK_DELTA`：管理台登录封禁告警增量阈值，默认 `1`
+- `ADMIN_UI_ALERT_COOLDOWN`：管理台告警冷却时间，默认 `5m`
 
 如果 `CONTROL_PLANE_ENABLED=false`，服务回退到静态用户：
 
@@ -83,17 +93,41 @@ docker compose -f deploy/docker-compose.yml up -d --build
 ```bash
 CONTROL_PLANE_ENABLED=true
 DB_PATH="/mnt/mmc0-4/proxy-platform/proxy.db"
+SMB_ROOT_DIR="/mnt/mmc0-4/proxy-platform/smb"
 BOOTSTRAP_USER="vpn"
 BOOTSTRAP_PASS="abc123456"
 BOOTSTRAP_ADMIN_USER="admin"
-BOOTSTRAP_ADMIN_PASS="StrongAdmin123"
+BOOTSTRAP_ADMIN_PASS="admin123"
 BOOTSTRAP_READONLY="ops"
 BOOTSTRAP_READONLY_PASS="OpsPass123"
 ADMIN_SESSION_TTL="12h"
 PASSWORD_MIN_LENGTH="8"
 TRUST_PROXY_HEADERS="true"
 REAL_IP_HEADER="X-Forwarded-For"
+ADMIN_RATE_LIMIT_RPS="20"
+ADMIN_RATE_LIMIT_BURST="60"
+ADMIN_LOGIN_MAX_FAILS="8"
+ADMIN_LOGIN_FAIL_WINDOW="15m"
+ADMIN_LOGIN_BLOCK_FOR="15m"
+ADMIN_UI_ALERT_RATE_LIMIT_DELTA="3"
+ADMIN_UI_ALERT_LOGIN_FAIL_DELTA="5"
+ADMIN_UI_ALERT_LOGIN_BLOCK_DELTA="1"
+ADMIN_UI_ALERT_COOLDOWN="5m"
 ```
+
+### SMB 目录约定
+
+- 每个用户对应目录：`/mnt/mmc0-4/proxy-platform/smb/<username>`
+- 创建用户默认不创建目录，管理员“开通SMB”后才创建目录
+- 管理员“关闭SMB”或删除用户时会清理目录
+- 管理台用户详情会显示 SMB 目录路径
+
+### WebDAV 兼容访问
+
+- 地址：`http://<HOST>:8088/webdav/`
+- 认证：使用代理用户名/密码（Basic Auth）
+- 前提：该用户已由管理员开通 SMB
+- 目录映射：每个用户仅能访问自己的目录 `SMB_ROOT_DIR/<username>`
 
 ## 本地运行
 
@@ -122,23 +156,30 @@ curl --socks5 vpn:abc123456@127.0.0.1:1080 https://example.com -I
 ```bash
 curl -i -X POST http://127.0.0.1:8088/api/admin/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"StrongAdmin123"}'
+  -d '{"username":"admin","password":"admin123"}'
 ```
 
 返回头中会带 `Set-Cookie: admin_session=...`。
+响应 JSON 会返回 `csrf_token`，后续所有写操作（POST/PUT/DELETE）都需要通过请求头 `X-CSRF-Token` 传回该值。
 
 Linux/macOS 下可直接保存 Cookie：
 
 ```bash
 curl -c cookie.txt -X POST http://127.0.0.1:8088/api/admin/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"StrongAdmin123"}'
+  -d '{"username":"admin","password":"admin123"}'
 ```
 
 之后所有管理请求带上：
 
 ```bash
 -b cookie.txt
+```
+
+同时请在写请求中增加：
+
+```bash
+-H "X-CSRF-Token: <csrf_token>"
 ```
 
 ### 当前身份
@@ -237,7 +278,7 @@ curl -X POST http://127.0.0.1:8088/api/admin/admins/ops2/password \
 curl -X POST http://127.0.0.1:8088/api/admin/profile/password \
   -b cookie.txt \
   -H "Content-Type: application/json" \
-  -d '{"old_password":"StrongAdmin123","new_password":"NewAdminPass456"}'
+  -d '{"old_password":"admin123","new_password":"NewAdminPass456"}'
 ```
 
 ### 会话列表与下线
@@ -256,6 +297,36 @@ curl -X DELETE http://127.0.0.1:8088/api/admin/sessions/SESSION_ID -b cookie.txt
 curl "http://127.0.0.1:8088/api/admin/audits?actor=admin&limit=50" -b cookie.txt
 ```
 
+### 安全统计（限流/防爆破）
+
+```bash
+curl http://127.0.0.1:8088/api/admin/security-stats -b cookie.txt
+```
+
+返回示例字段：
+
+- `admin_rate_limited_total`：管理 API 被限流总次数
+- `admin_login_failed_total`：管理员登录失败总次数
+- `admin_login_blocked_total`：管理员登录被封禁命中总次数
+- `blocked_active`：当前仍在封禁窗口内的键数量
+
+当触发限流或防爆破时，接口会返回 `429`：
+
+- 管理 API 限流：`{"error":"too_many_requests","reason":"admin_api_rate_limited"}`
+- 登录封禁：`{"error":"too_many_attempts","retry_after_seconds":123}`
+
+审计日志可按以下动作筛选安全事件：
+
+- `admin_api_rate_limited`：命中管理 API 限流
+- `admin_login_failed`：管理员登录失败
+- `admin_login_blocked`：管理员登录被临时封禁
+
+管理台内置了安全统计自动告警（前端每 60 秒轮询，可由环境变量调整）：
+
+- 仅当增量达到阈值才弹窗：限流 `+3`、登录失败 `+5`、登录封禁 `+1`
+- 告警冷却时间：5 分钟（冷却内不重复弹窗）
+- 审计页会显示当前生效的阈值与冷却时间（以服务端返回配置为准）
+
 ## 管理角色
 
 - `super`：允许全部管理操作
@@ -273,3 +344,4 @@ curl "http://127.0.0.1:8088/api/admin/audits?actor=admin&limit=50" -b cookie.txt
 - 用户和管理员密码会以哈希形式保存；旧的明文代理用户密码会在首次成功登录时自动升级为哈希
 - 建议在公网暴露管理口时启用反向代理 HTTPS，并将 `ADMIN_COOKIE_SECURE=true`
 - 仅在可信反代链路下开启 `TRUST_PROXY_HEADERS=true`，避免伪造请求头导致来源 IP 污染
+
